@@ -18,7 +18,16 @@ module.exports = function(RED) {
       var chatId = msg.payload.chatId || (originalMessage && originalMessage.chat.id);
       var context = node.context();
       var chatContext = context.global.get('chat:' + chatId);
-      var content = msg.payload != null && msg.payload.content != null ? msg.payload.content : null;
+
+      // exit if payload content is not string
+      var content = null;
+      if (msg.payload != null && msg.payload.content != null && _.isString(msg.payload.content)) {
+        content = msg.payload.content;
+      }
+      if (_.isEmpty(content)) {
+        return;
+      }
+
       var bot = new RiveScript({utf8: true, debug: false});
       if (chatContext != null) {
         // anything that is not string printable

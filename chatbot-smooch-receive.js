@@ -1,25 +1,199 @@
 var _ = require('underscore');
 var moment = require('moment');
+var SmoochCore = require('smooch-core');
 var ChatContext = require('./lib/chat-context.js');
 var ChatLog = require('./lib/chat-log.js');
-var helpers = require('./lib/helpers/facebook.js');
+var helpers = require('./lib/helpers/smooch.js');
 var fs = require('fs');
 var os = require('os');
 var request = require('request').defaults({ encoding: null });
 var https = require('https');
 var http = require('http');
-var Bot = require('messenger-bot');
+var events = require('events');
 var clc = require('cli-color');
 
-var DEBUG = false;
+var DEBUG = true;
 var green = clc.greenBright;
 var white = clc.white;
 var red = clc.red;
 var grey = clc.blackBright;
 
+
+
+function SmoochBot(params) {
+
+  var _events = {};
+
+  // using app token
+  var smoochCore = new SmoochCore({
+    keyId: 'app_57cee0052fee375e00cc7345',
+    secret: 'LL9VVOUNrTRPp3cSQf2la9Hd',
+    scope: 'app', // app or appUser
+  });
+
+
+  var api = {
+
+    on: function(eventName, callback) {
+      if (_events[eventName] == null) {
+        _events[eventName] = [];
+      }
+      _events[eventName].push(callback);
+    },
+
+    emit: function(eventName, obj) {
+      if (_events[eventName] != null) {
+        _events[eventName].forEach(function(callback) {
+          callback(obj);
+        });
+      }
+    },
+
+    sendMessage: function(chatId, text, handleError) {
+      smoochCore.appUsers.sendMessage(chatId, {
+        text: text,
+        role: 'appMaker'
+      }).then(function(result) {
+        // do nothing
+      }).catch(function(err) {
+        handleError(err);
+        console.log('err---', err);
+      });
+    },
+
+    sendActions: function(chatId, text, actions) {
+      actions = [
+        {"type": "reply", "text": "Burger King", "payload": "BURGER_KING" },
+        {"type": "reply", "text": "Pizza Hut", "payload": "PIZZA_HUT"}
+      ];
+
+      return smoochCore.appUsers.sendMessage(chatId, {
+        text: text,
+        actions: actions,
+        role: 'appMaker'
+      });
+    },
+
+
+    uploadImage: function(chatId, image, handleError) {
+
+      return new Promise(function(resolve, reject) {
+        params = _.extend({
+          recipient: null,
+          filename: 'tmp-file',
+          token: null,
+          buffer: null,
+          type: 'image'
+        }, params);
+
+        var tmpFile = os.tmpdir() + '/' + params.filename;
+
+        // write to filesystem to use stream
+        fs.writeFile(tmpFile, image, function(err) {
+          if (err) {
+            reject(err);
+          } else {
+            // prepare payload
+            var filedata = null;
+            switch(params.type) {
+              case 'image':
+                filedata = {
+                  value: fs.createReadStream(tmpFile),
+                  options: {
+                    filename: params.filename,
+                    contentType: 'image/png' // fix extension
+                  }
+                };
+                break;
+              case 'audio':
+                filedata = {
+                  value: fs.createReadStream(tmpFile),
+                  options: {
+                    filename: params.filename,
+                    contentType: 'audio/mp3'
+                  }
+                };
+                break;
+            }
+            // upload and send
+            var formData = {
+              role: 'appMaker',
+              name: 'steve',
+              source: filedata
+            };
+
+            request.post({
+              url: 'https://api.smooch.io/v1/appusers/' + chatId + '/images',
+              headers: {
+                'Authorization': smoochCore.authHeaders.Authorization,
+                'Content-Type': 'application/json'
+              },
+              formData: formData
+            }, function(err, response, body) {
+              if (err) {
+                reject(err);
+              } else {
+                resolve();
+              }
+            });
+          }
+        }); // end writeFile
+      });
+    },
+
+
+    /*uploadImage: function(chatId, image, handleError) {
+      console.log('mando image', chatId);
+      smoochCore.appUsers.uploadImage(chatId, image).then(function(result) {
+        // do nothing
+      }).catch(function(err) {
+        handleError(err);
+        console.log('err---', err);
+      });
+    },*/
+
+
+    middleware: function () {
+
+      return function(req, res) {
+
+        // we always write 200, otherwise facebook will keep retrying the request
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        //if (req.url === '/_status') return res.end(JSON.stringify({status: 'ok'}))
+        //if (this.verify_token && req.method === 'GET') return this._verify(req, res)
+        if (req.method !== 'POST') return res.end();
+
+        var body = '';
+        req.on('data', function(chunk) {
+          body += chunk
+        });
+
+        req.on('end', function() {
+          var parsed = JSON.parse(body);
+          res.end(JSON.stringify({status: 'ok'}));
+
+          if (parsed.trigger === 'message:appUser') {
+            parsed.messages.forEach(function(message) {
+              api.emit('message', message);
+            });
+          }
+
+        });
+      }
+
+    }
+
+  };
+
+  return api;
+
+};
+
+
+
 module.exports = function(RED) {
 
-  function FacebookBotNode(n) {
+  function SmoochBotNode(n) {
     RED.nodes.createNode(this, n);
 
     var self = this;
@@ -40,17 +214,6 @@ module.exports = function(RED) {
 
     this.handleMessage = function(botMsg) {
 
-      /*
-       { sender: { id: '10153461620831415' },
-       recipient: { id: '141972351547' },
-       timestamp: 1468868282071,
-       message:
-       { mid: 'mid.1468868282014:a9429329545544f523',
-       seq: 334,
-       text: 'test' },
-       transport: 'facebook' }
-
-       */
 
       var facebookBot = self.bot;
 
@@ -61,11 +224,11 @@ module.exports = function(RED) {
       }
 
       // mark the original message with the platform
-      botMsg.transport = 'facebook';
+      botMsg.transport = 'smooch';
 
-      var userId = botMsg.sender.id;
-      var chatId = botMsg.sender.id;
-      var messageId = botMsg.message.mid;
+      var userId = botMsg.authorId;
+      var chatId = botMsg.authorId;
+      var messageId = botMsg._id;
       var context = self.context();
       // todo fix this
       //var isAuthorized = node.config.isAuthorized(username, userId);
@@ -78,29 +241,25 @@ module.exports = function(RED) {
         context.global.set('chat:' + chatId, chatContext);
       }
 
-      var payload = null;
       // decode the message, eventually download stuff
       self.getMessageDetails(botMsg, self.bot)
-        .then(function (obj) {
-          payload = obj;
-          return helpers.getOrFetchProfile(userId, self.bot)
-        })
-        .then(function(profile) {
+        .then(function(payload) {
           // store some information
           chatContext.set('chatId', chatId);
-          chatContext.set('messageId', botMsg.message.mid);
+          chatContext.set('messageId', messageId);
           chatContext.set('userId', userId);
-          chatContext.set('firstName', profile.first_name);
-          chatContext.set('lastName', profile.last_name);
+          chatContext.set('firstName', botMsg.name);
+          chatContext.set('lastName', null);
           chatContext.set('authorized', isAuthorized);
-          chatContext.set('transport', 'facebook');
-          chatContext.set('message', botMsg.message.text);
+          chatContext.set('transport', 'smooch');
+          chatContext.set('message', botMsg.text);
 
           var chatLog = new ChatLog(chatContext);
+
           return chatLog.log({
             payload: payload,
             originalMessage: {
-              transport: 'facebook',
+              transport: 'smooch',
               chat: {
                 id: chatId
               }
@@ -108,8 +267,6 @@ module.exports = function(RED) {
           }, self.log)
         })
         .then(function (msg) {
-
-
 
           var currentConversationNode = chatContext.get('currentConversationNode');
           // if a conversation is going on, go straight to the conversation node, otherwise if authorized
@@ -141,16 +298,16 @@ module.exports = function(RED) {
 
         if (!this.bot) {
           // todo move to config
-          this.bot = new Bot({
-            token: this.token,
-            verify: this.verify_token,
+          this.bot = new SmoochBot({
+            token: this.token, // todo fix here
+            /*verify: this.verify_token,
             app_secret: this.app_secret,
             key_pem: this.key_pem,
-            cert_pem: this.cert_pem
+            cert_pem: this.cert_pem*/
           });
 
           console.log('');
-          console.log(grey('------ Facebook Webhook ----------------'));
+          console.log(grey('------ Smooch Webhook ----------------'));
           if (this.key_pem != null && this.cert_pem) {
             try {
               var options = {
@@ -165,16 +322,14 @@ module.exports = function(RED) {
               return;
             }
             console.log(green('Using SSL: ') + white('yes'));
-            console.log(green('Webhook URL: ') + white('https://localhost:3099'));
-            console.log(green('Verify token is: ') + white(this.verify_token));
+            console.log(green('Webhook URL: ') + white('https://localhost:3199'));
             console.log(green('Key PEM: ') + white(this.key_pem));
             console.log(green('Cert PEM: ') + white(this.cert_pem));
-            this.server = https.createServer(options, this.bot.middleware()).listen(3099);
+            this.server = https.createServer(options, this.bot.middleware()).listen(3199);
           } else {
             console.log(green('Using SSL: ') + white('no'));
-            console.log(green('Webhook URL: ') + white('http://localhost:3099'));
-            console.log(green('Verify token is: ') + white(this.verify_token));
-            this.server = http.createServer(this.bot.middleware()).listen(3099);
+            console.log(green('Webhook URL: ') + white('http://localhost:3199'));
+            this.server = http.createServer(this.bot.middleware()).listen(3199);
           }
           console.log('');
 
@@ -197,86 +352,41 @@ module.exports = function(RED) {
     };
 
     // creates the message details object from the original message
-    this.getMessageDetails = function (botMsg, bot) {
+    this.getMessageDetails = function (message, bot) {
+
       return new Promise(function (resolve, reject) {
 
-        var userId = botMsg.sender.id;
-        var chatId = botMsg.sender.id;
-        var messageId = botMsg.message.mid;
+        var userId = message.authorId;
+        var chatId = message.authorId;
+        var messageId = message._id;
 
-        if (botMsg.message == null) {
-          reject('Unable to detect inbound message for Facebook');
-        }
+        if (message.mediaUrl != null && message.mediaType.indexOf('image') !== -1) {
 
-        var message = botMsg.message;
-        if (!_.isEmpty(message.text)) {
+          helpers.downloadFile(message.mediaUrl)
+            .then(function(buffer) {
+              console.log('immagine scaricata', buffer);
+              resolve({
+                chatId: chatId,
+                messageId: messageId,
+                type: 'photo',
+                content: buffer,
+                date: moment(message.received),
+                inbound: true
+              });
+            })
+            .catch(function() {
+              reject('Unable to download ' + message.mediaUrl);
+            });
+        } else if (!_.isEmpty(message.text)) {
           resolve({
             chatId: chatId,
             messageId: messageId,
             type: 'message',
             content: message.text,
-            date: moment(botMsg.timestamp),
+            date: moment(message.received),
             inbound: true
           });
-          return;
         }
-
-        if (_.isArray(message.attachments) && !_.isEmpty(message.attachments)) {
-
-          var attachment = message.attachments[0];
-
-          switch(attachment.type) {
-            case 'image':
-              // download the image into a buffer
-              helpers.downloadFile(attachment.payload.url)
-                .then(function(buffer) {
-                  resolve({
-                    chatId: chatId,
-                    messageId: messageId,
-                    type: 'photo',
-                    content: buffer,
-                    date: moment(botMsg.timestamp),
-                    inbound: true
-                  });
-                })
-                .catch(function() {
-                  reject('Unable to download ' + attachment.payload.url);
-                });
-
-
-              break;
-            case 'location':
-
-              /*{ title: 'Guidone\'s Location',
-               url: 'https://www.facebook.com/l.php?u=https%3A%2F%2Fwww.bing.com%2Fmaps%2Fdefault.aspx%3Fv%3D2%26pc%3DFACEBK%26mid%3D8100%26where1%3D45.507150729138%252C%2B9.1766030741468%26FORM%3DFBKPL1%26mkt%3Den-US&h=BAQG9UHuj&s=1&enc=AZOkqQ-WuRDRw4-R3i3g-6jw_KoqbAhvPARjAP3qI7jHfAvK9UqmTJ0OufBOyiKi1JEYLpO05GWsfflesPUODV4DZr0ndofrwllgpzqT-VyiPw',
-               type: 'location',
-               payload: { coordinates: { lat: 45.507150729138, long: 9.1766030741468 } } }*/
-
-              resolve({
-                chatId: chatId,
-                messageId: messageId,
-                type: 'location',
-                content: {
-                  latitude: attachment.payload.cooordinates.lat,
-                  longitude: attachment.payload.cooordinates.long
-                },
-                date: moment(botMsg.timestamp),
-                inbound: true
-              });
-
-              break;
-          }
-
-        } else {
-          reject('Unable to detect inbound message for Facebook Messenger');
-        }
-
-
-        /*
-
-         { type: 'image',
-         payload: { url: 'https://scontent.xx.fbcdn.net/v/t34.0-12/13714319_10153570333851415_183484103_n.png?_nc_ad=z-m&oh=1fd1db8c6faec91c340b22f75a2eb025&oe=578EF45F' } }
-         */
 
 
       });
@@ -284,15 +394,12 @@ module.exports = function(RED) {
 
   }
 
-  RED.nodes.registerType('chatbot-facebook-node', FacebookBotNode, {
+  RED.nodes.registerType('chatbot-smooch-node', SmoochBotNode, {
     credentials: {
       token: {
         type: 'text'
       },
       app_secret: {
-        type: 'text'
-      },
-      verify_token: {
         type: 'text'
       },
       key_pem: {
@@ -304,7 +411,7 @@ module.exports = function(RED) {
     }
   });
 
-  function FacebookInNode(config) {
+  function SmoochInNode(config) {
     RED.nodes.createNode(this, config);
     var node = this;
     this.bot = config.bot;
@@ -333,10 +440,10 @@ module.exports = function(RED) {
       node.warn('Missing configuration in Facebook Messenger Receiver');
     }
   }
-  RED.nodes.registerType('chatbot-facebook-receive', FacebookInNode);
+  RED.nodes.registerType('chatbot-smooch-receive', SmoochInNode);
 
 
-  function FacebookOutNode(config) {
+  function SmoochOutNode(config) {
     RED.nodes.createNode(this, config);
     var node = this;
     this.bot = config.bot;
@@ -375,74 +482,17 @@ module.exports = function(RED) {
 
         switch (type) {
           case 'action':
-            request({
-              method: 'POST',
-              json: {
-                recipient: {
-                  id: msg.payload.chatId
-                },
-                'sender_action': 'typing_on'
-              },
-              url: 'https://graph.facebook.com/v2.6/me/messages?access_token=' + credentials.token
-            }, reportError);
-            break;
 
-          case 'buttons':
-            // prepare buttons
-            var quickReplies = _(msg.payload.buttons).map(function(button) {
-              return {
-                content_type: 'text',
-                title: button,
-                payload: button
-              };
-            });
-            // send
-            bot.sendMessage(
-              msg.payload.chatId,
-              {
-                text: msg.payload.content,
-                quick_replies: quickReplies
-              },
-              reportError
-            );
             break;
 
           case 'message':
-            bot.sendMessage(
-              msg.payload.chatId,
-              {
-                text: msg.payload.content
-              },
-              reportError
-            );
+            bot.sendMessage(msg.payload.chatId, msg.payload.content, reportError);
             break;
 
-          case 'location':
-            var lat = msg.payload.content.latitude;
-            var lon = msg.payload.content.longitude;
+          case 'buttons':
 
-            var attachment = {
-              'type': 'template',
-              'payload': {
-                'template_type': 'generic',
-                'elements': {
-                  'element': {
-                    'title': !_.isEmpty(msg.payload.place) ? msg.payload.place : 'Position',
-                    'image_url': 'https:\/\/maps.googleapis.com\/maps\/api\/staticmap?size=764x400&center='
-                      + lat + ',' + lon + '&zoom=16&markers=' + lat + ',' + lon,
-                    'item_url': 'http:\/\/maps.apple.com\/maps?q=' + lat + ',' + lon + '&z=16'
-                  }
-                }
-              }
-            };
+            return bot.sendActions(msg.payload.chatId, msg.payload.content, msg.payload.actions);
 
-            bot.sendMessage(
-              msg.payload.chatId,
-              {
-                attachment: attachment
-              },
-              reportError
-            );
             break;
 
           case 'audio':
@@ -460,7 +510,9 @@ module.exports = function(RED) {
 
           case 'photo':
             var image = msg.payload.content;
-            helpers.uploadBuffer({
+            console.log('brandeggio image', msg.payload.content);
+            bot.uploadImage(msg.payload.chatId, msg.payload.content, reportError);
+            /*helpers.uploadBuffer({
               recipient: msg.payload.chatId,
               type: 'image',
               buffer: image,
@@ -468,7 +520,7 @@ module.exports = function(RED) {
               filename: msg.payload.filename
             }).catch(function(err) {
               reject(err);
-            });
+            });*/
             break;
 
           default:
@@ -492,12 +544,12 @@ module.exports = function(RED) {
     this.on('input', function (msg) {
 
       // check if the message is from facebook
-      if (msg.originalMessage != null && msg.originalMessage.transport !== 'facebook') {
+      if (msg.originalMessage != null && msg.originalMessage.transport !== 'smooch') {
         // exit, it's not from facebook
         return;
       }
 
-      if (msg.payload == null) {
+      /*f (msg.payload == null) {
         node.warn("msg.payload is empty");
         return;
       }
@@ -508,9 +560,8 @@ module.exports = function(RED) {
       if (msg.payload.type == null) {
         node.warn("msg.payload.type is empty");
         return;
-      }
+      }*/
 
-      var channelId = msg.payload.chatId;
       var context = node.context();
       var track = node.track;
       var chatId = msg.payload.chatId || (originalMessage && originalMessage.chat.id);
@@ -532,6 +583,6 @@ module.exports = function(RED) {
 
     });
   }
-  RED.nodes.registerType('chatbot-facebook-send', FacebookOutNode);
+  RED.nodes.registerType('chatbot-smooch-send', SmoochOutNode);
 
 };
